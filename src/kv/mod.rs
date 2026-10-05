@@ -256,6 +256,14 @@ pub use self::key::{Key, ToKey};
 pub use self::source::{Source, VisitSource};
 pub use self::value::{ToValue, Value, VisitValue};
 
+#[cfg(feature = "alloc")]
+mod validator;
+#[cfg(feature = "alloc")]
+pub use self::validator::{
+    AllowedKeys, Duplicate, DuplicatePolicy, PairReport, Report, ValidationError, Validator,
+    ValueKind,
+};
+
 #[cfg(feature = "kv_unstable")]
 pub mod source;
 #[cfg(feature = "kv_unstable")]
