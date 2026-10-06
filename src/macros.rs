@@ -121,13 +121,20 @@ macro_rules! __log {
     (logger: $logger:expr, target: $target:expr, $lvl:expr, $($key:tt $(:$capture:tt)? $(= $value:expr)?),+; $($arg:tt)+) => ({
         let lvl = $lvl;
         if lvl <= $crate::STATIC_MAX_LEVEL && lvl <= $crate::max_level() {
-            $crate::__private_api::log(
-                $logger,
-                $crate::__private_api::format_args!($($arg)+),
-                lvl,
-                &($target, $crate::__private_api::module_path!(), $crate::__private_api::loc()),
-                &[$(($crate::__log_key!($key), $crate::__log_value!($key $(:$capture)* = $($value)*))),+] as &[_],
-            );
+            // Snapshot the logger's enabled decision for this record. The
+            // level/target rule selected here is fixed for the corresponding
+            // `log` call; a later rule update cannot change this in-flight
+            // record's decision. The message is only evaluated when allowed.
+            let target = $target;
+            if $crate::__private_api::enabled($logger, lvl, target) {
+                $crate::__private_api::log(
+                    $logger,
+                    $crate::__private_api::format_args!($($arg)+),
+                    lvl,
+                    &(target, $crate::__private_api::module_path!(), $crate::__private_api::loc()),
+                    &[$(($crate::__log_key!($key), $crate::__log_value!($key $(:$capture)* = $($value)*))),+] as &[_],
+                );
+            }
         }
     });
 
@@ -135,13 +142,20 @@ macro_rules! __log {
     (logger: $logger:expr, target: $target:expr, $lvl:expr, $($arg:tt)+) => ({
         let lvl = $lvl;
         if lvl <= $crate::STATIC_MAX_LEVEL && lvl <= $crate::max_level() {
-            $crate::__private_api::log(
-                $logger,
-                $crate::__private_api::format_args!($($arg)+),
-                lvl,
-                &($target, $crate::__private_api::module_path!(), $crate::__private_api::loc()),
-                (),
-            );
+            // Snapshot the logger's enabled decision for this record. The
+            // level/target rule selected here is fixed for the corresponding
+            // `log` call; a later rule update cannot change this in-flight
+            // record's decision. The message is only evaluated when allowed.
+            let target = $target;
+            if $crate::__private_api::enabled($logger, lvl, target) {
+                $crate::__private_api::log(
+                    $logger,
+                    $crate::__private_api::format_args!($($arg)+),
+                    lvl,
+                    &(target, $crate::__private_api::module_path!(), $crate::__private_api::loc()),
+                    (),
+                );
+            }
         }
     });
 }
