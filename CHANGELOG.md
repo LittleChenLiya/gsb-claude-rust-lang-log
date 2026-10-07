@@ -1,5 +1,13 @@
 # Change Log
 
+## [Unreleased]
+
+### What's Changed
+* Add `kv::json`, a JSON bridge for structured key-values that encodes only the
+  scalars `Value` publicly supports, never calls `Debug`, rejects opaque values
+  with their key preserved, and writes output atomically (no half-written JSON
+  on failure)
+
 ## [0.4.34] - 2026-08-22
 
 ## What's Changed

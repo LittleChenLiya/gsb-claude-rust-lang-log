@@ -246,6 +246,9 @@
 mod error;
 mod key;
 
+#[cfg(feature = "std")]
+pub mod json;
+
 #[cfg(not(feature = "kv_unstable"))]
 mod source;
 #[cfg(not(feature = "kv_unstable"))]
