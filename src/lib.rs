@@ -466,6 +466,14 @@ const INITIALIZED: usize = 2;
 
 static MAX_LOG_LEVEL_FILTER: AtomicUsize = AtomicUsize::new(0);
 
+// A generation counter for the global maximum log level. It is bumped every
+// time the maximum level is installed through `set_max_level` or a
+// `ScopedMaxLevelGuard`. A guard only restores its saved level when the
+// generation still matches the one it observed, so an explicit `set_max_level`
+// (or any other later change) is never overwritten by a stale guard.
+#[cfg(target_has_atomic = "ptr")]
+static MAX_LEVEL_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
 static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
 static SET_LOGGER_ERROR: &str = "attempted to set a logger after the logging system \
@@ -1385,6 +1393,9 @@ where
 #[cfg(target_has_atomic = "ptr")]
 pub fn set_max_level(level: LevelFilter) {
     MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    // Invalidate any outstanding `ScopedMaxLevelGuard`s so that a stale guard
+    // cannot restore its saved level over this explicit update.
+    MAX_LEVEL_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A thread-unsafe version of [`set_max_level`].
@@ -1412,6 +1423,9 @@ pub unsafe fn set_max_level_racy(level: LevelFilter) {
     // platform doesn't support `target_has_atomic = "ptr"`, so even though this looks the same
     // as `set_max_level` it may have different safety properties.
     MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    // See `set_max_level`: explicit updates invalidate outstanding guards.
+    #[cfg(target_has_atomic = "ptr")]
+    MAX_LEVEL_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Returns the current maximum log level.
@@ -1436,6 +1450,96 @@ pub fn max_level() -> LevelFilter {
     // is by `set_max_level` above, i.e. by casting a `LevelFilter` to `usize`.
     // So any usize stored in `MAX_LOG_LEVEL_FILTER` is a valid discriminant.
     unsafe { mem::transmute(MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed)) }
+}
+
+/// Sets the global maximum log level for the scope of the returned guard.
+///
+/// This behaves like [`set_max_level`] — it only adjusts the global level
+/// filter and never touches the registered logger — but the previous maximum
+/// level is restored when the returned [`ScopedMaxLevelGuard`] is dropped.
+/// Because the restore happens in `Drop`, it also runs when the scope is left
+/// by a panic during unwinding.
+///
+/// Guards can be nested; dropping them in stack (LIFO) order restores each
+/// enclosing level in turn:
+///
+/// ```
+/// # use log::{LevelFilter, max_level, set_max_level, set_max_level_scoped};
+/// set_max_level(LevelFilter::Info);
+/// let outer = set_max_level_scoped(LevelFilter::Warn);
+/// let inner = set_max_level_scoped(LevelFilter::Error);
+/// drop(inner);
+/// assert_eq!(max_level(), LevelFilter::Warn);
+/// drop(outer);
+/// assert_eq!(max_level(), LevelFilter::Info);
+/// ```
+///
+/// An explicit [`set_max_level`] (or any other level change) that happens
+/// while a guard is alive invalidates that guard: dropping it afterwards is a
+/// no-op, so the explicit update is never overwritten by a stale guard.
+///
+/// [`set_max_level`]: fn.set_max_level.html
+#[cfg(target_has_atomic = "ptr")]
+pub fn set_max_level_scoped(level: LevelFilter) -> ScopedMaxLevelGuard {
+    let previous = max_level();
+    MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    let generation = MAX_LEVEL_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    ScopedMaxLevelGuard {
+        previous,
+        level,
+        generation,
+    }
+}
+
+/// A guard that restores the previous maximum log level on drop.
+///
+/// Returned by [`set_max_level_scoped`]. See its documentation for details.
+///
+/// [`set_max_level_scoped`]: fn.set_max_level_scoped.html
+#[cfg(target_has_atomic = "ptr")]
+#[derive(Debug)]
+pub struct ScopedMaxLevelGuard {
+    previous: LevelFilter,
+    level: LevelFilter,
+    generation: usize,
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl ScopedMaxLevelGuard {
+    /// The maximum level that was in effect before this guard was created.
+    ///
+    /// This is the level that will be restored when the guard is dropped,
+    /// unless the guard has been invalidated by a later explicit update.
+    pub fn previous_level(&self) -> LevelFilter {
+        self.previous
+    }
+
+    /// The maximum level installed by this guard.
+    pub fn level(&self) -> LevelFilter {
+        self.level
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl Drop for ScopedMaxLevelGuard {
+    fn drop(&mut self) {
+        // Only restore when the generation is still exactly the one this
+        // guard installed. Nested guards restore in stack order: dropping an
+        // inner guard rewinds the generation so its enclosing guard still
+        // matches. Any explicit `set_max_level` bumps the generation, which
+        // invalidates every outstanding guard below it.
+        if MAX_LEVEL_GENERATION
+            .compare_exchange(
+                self.generation,
+                self.generation - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            MAX_LOG_LEVEL_FILTER.store(self.previous as usize, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Sets the global logger to a `Box<Log>`.
