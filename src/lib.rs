@@ -464,7 +464,38 @@ const UNINITIALIZED: usize = 0;
 const INITIALIZING: usize = 1;
 const INITIALIZED: usize = 2;
 
+// `MAX_LOG_LEVEL_FILTER` packs two values into a single machine word:
+// - the low `LEVEL_MASK` bits hold the current `LevelFilter` discriminant
+//   (`Off` = 0, ..., `Trace` = 5);
+// - the remaining bits hold a monotonically increasing generation counter
+//   that is bumped every time the level is updated explicitly (i.e. through
+//   `set_max_level`). Scoped guards snapshot the generation on creation and
+//   use it on drop to detect explicit updates that happened while they were
+//   alive, so a stale guard never clobbers a newer explicit level.
 static MAX_LOG_LEVEL_FILTER: AtomicUsize = AtomicUsize::new(0);
+
+// Number of low bits used to store the `LevelFilter`. The largest
+// discriminant is `Trace` = 5, so three bits are sufficient.
+const LEVEL_BITS: u32 = 3;
+const LEVEL_MASK: usize = (1 << LEVEL_BITS) - 1;
+
+#[inline]
+fn pack_level(level: usize, generation: usize) -> usize {
+    debug_assert!(level <= LEVEL_MASK);
+    generation
+        .wrapping_shl(LEVEL_BITS)
+        .wrapping_add(level & LEVEL_MASK)
+}
+
+#[inline]
+fn unpack_level(packed: usize) -> usize {
+    packed & LEVEL_MASK
+}
+
+#[inline]
+fn unpack_generation(packed: usize) -> usize {
+    packed.wrapping_shr(LEVEL_BITS)
+}
 
 static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
@@ -1381,10 +1412,20 @@ where
 /// Generally, this should only be called by the active logging implementation.
 ///
 /// Note that `Trace` is the maximum level, because it provides the maximum amount of detail in the emitted logs.
+///
+/// An explicit call to this function always takes precedence over any active
+/// scoped override created with [`set_max_level_scoped`]: when the
+/// [`MaxLevelGuard`] of such an override is later dropped, it will observe
+/// that the level was updated out from under it and will not restore its old
+/// value. See [`set_max_level_scoped`] for details.
 #[inline]
 #[cfg(target_has_atomic = "ptr")]
 pub fn set_max_level(level: LevelFilter) {
-    MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    // Bump the generation so any active scoped guard treats this store as an
+    // explicit update instead of restoring over it.
+    let current = MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed);
+    let next = pack_level(level as usize, unpack_generation(current).wrapping_add(1));
+    MAX_LOG_LEVEL_FILTER.store(next, Ordering::Relaxed);
 }
 
 /// A thread-unsafe version of [`set_max_level`].
@@ -1393,6 +1434,9 @@ pub fn set_max_level(level: LevelFilter) {
 /// support for atomics that is needed by [`set_max_level`].
 ///
 /// In almost all cases, [`set_max_level`] should be preferred.
+///
+/// As with [`set_max_level`], an explicit call invalidates any active
+/// scoped override created with [`set_max_level_scoped`].
 ///
 /// # Safety
 ///
@@ -1411,7 +1455,9 @@ pub unsafe fn set_max_level_racy(level: LevelFilter) {
     // `MAX_LOG_LEVEL_FILTER` uses a `Cell` as the underlying primitive when a
     // platform doesn't support `target_has_atomic = "ptr"`, so even though this looks the same
     // as `set_max_level` it may have different safety properties.
-    MAX_LOG_LEVEL_FILTER.store(level as usize, Ordering::Relaxed);
+    let current = MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed);
+    let next = pack_level(level as usize, unpack_generation(current).wrapping_add(1));
+    MAX_LOG_LEVEL_FILTER.store(next, Ordering::Relaxed);
 }
 
 /// Returns the current maximum log level.
@@ -1433,9 +1479,131 @@ pub fn max_level() -> LevelFilter {
     // this transmute is sound if and only if `MAX_LOG_LEVEL_FILTER`
     // is set to a usize that is a valid discriminant for `LevelFilter`.
     // Since `MAX_LOG_LEVEL_FILTER` is private, the only time it's set
-    // is by `set_max_level` above, i.e. by casting a `LevelFilter` to `usize`.
-    // So any usize stored in `MAX_LOG_LEVEL_FILTER` is a valid discriminant.
-    unsafe { mem::transmute(MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed)) }
+    // is by `set_max_level`, `set_max_level_racy` or `set_max_level_scoped`
+    // above, i.e. by casting a `LevelFilter` to `usize` (the level bits).
+    // So the level bits stored in `MAX_LOG_LEVEL_FILTER` are a valid
+    // discriminant.
+    let packed = MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed);
+    unsafe { mem::transmute(unpack_level(packed)) }
+}
+
+/// A guard that restores the previous maximum log level when dropped.
+///
+/// Created by [`set_max_level_scoped`]. The restoration runs even if the
+/// scope exits through a panic while the guard is being unwound.
+///
+/// Guards restore in stack (LIFO) order: when nested, dropping an inner
+/// guard brings back the level that was active when it was created, and
+/// dropping an outer guard afterwards brings back the level active before
+/// the outermost override.
+///
+/// An explicit update through [`set_max_level`] or
+/// [`set_max_level_racy`] while a guard is alive always wins: a stale guard
+/// whose captured level has been superseded will skip its restoration
+/// instead of overwriting the explicit update. Guards created after such an
+/// update naturally snapshot the new value.
+#[must_use = "the override only stays in effect while the guard is alive"]
+pub struct MaxLevelGuard {
+    // The whole packed state (`generation` in the high bits, level in the
+    // low bits) captured when the guard was created. On drop the packed
+    // value is written back only if the generation still matches, which
+    // both restores the previous level and preserves the "no explicit
+    // update happened while this guard was alive" invariant.
+    previous: usize,
+}
+
+impl fmt::Debug for MaxLevelGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaxLevelGuard")
+            .field(
+                "previous_level",
+                // The stored level bits always hold a valid `LevelFilter`.
+                &unsafe { mem::transmute::<usize, LevelFilter>(unpack_level(self.previous)) },
+            )
+            .field("generation", &unpack_generation(self.previous))
+            .finish()
+    }
+}
+
+impl Drop for MaxLevelGuard {
+    fn drop(&mut self) {
+        // Restore the snapshot only if no explicit `set_max_level` call
+        // bumped the generation while this guard was alive. Nested guards
+        // do not bump the generation, so an inner drop leaves the
+        // generation untouched and an outer drop can still restore.
+        //
+        // This load/store pair is enough: a generation mismatch means an
+        // explicit update happened and must be preserved, while a match
+        // means we are simply unwinding the stack of scoped overrides.
+        let current = MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed);
+        if unpack_generation(current) == unpack_generation(self.previous) {
+            MAX_LOG_LEVEL_FILTER.store(self.previous, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Sets the global maximum log level for the lifetime of the returned guard.
+///
+/// This is a scoped variant of [`set_max_level`]: it sets `level` exactly
+/// like [`set_max_level`] does, and when the returned [`MaxLevelGuard`] is
+/// dropped the maximum level is restored to the value that was active before
+/// this call (including if the call was made inside another scoped
+/// override). The filtering semantics are unchanged: the macros still
+/// compare records against [`max_level`], and logger registration state is
+/// not touched.
+///
+/// # Nesting
+///
+/// Overrides nest as a stack. Dropping an inner guard restores the level
+/// visible when it was entered, so the outer override becomes visible again:
+///
+/// ```
+/// use log::LevelFilter;
+///
+/// log::set_max_level(LevelFilter::Info);
+/// let outer = log::set_max_level_scoped(LevelFilter::Warn);
+/// assert_eq!(log::max_level(), LevelFilter::Warn);
+/// {
+///     let inner = log::set_max_level_scoped(LevelFilter::Off);
+///     assert_eq!(log::max_level(), LevelFilter::Off);
+///     drop(inner);
+/// }
+/// assert_eq!(log::max_level(), LevelFilter::Warn);
+/// drop(outer);
+/// assert_eq!(log::max_level(), LevelFilter::Info);
+/// ```
+///
+/// # Explicit updates win
+///
+/// If [`set_max_level`] (or [`set_max_level_racy`]) is called while a guard
+/// is alive, the explicit value is kept and the stale guard does not
+/// overwrite it when dropped:
+///
+/// ```
+/// use log::LevelFilter;
+///
+/// log::set_max_level(LevelFilter::Info);
+/// let guard = log::set_max_level_scoped(LevelFilter::Debug);
+/// log::set_max_level(LevelFilter::Error);
+/// drop(guard);
+/// assert_eq!(log::max_level(), LevelFilter::Error);
+/// ```
+///
+/// # Panics
+///
+/// Restoration also runs during unwinding, so an early return caused by a
+/// panic still restores the enclosing level.
+#[inline]
+pub fn set_max_level_scoped(level: LevelFilter) -> MaxLevelGuard {
+    let previous = MAX_LOG_LEVEL_FILTER.load(Ordering::Relaxed);
+    // Entering a scope does not bump the generation: only explicit
+    // `set_max_level` updates do, which lets nested guards restore in stack
+    // order while explicit updates invalidate all active guards.
+    MAX_LOG_LEVEL_FILTER.store(
+        pack_level(level as usize, unpack_generation(previous)),
+        Ordering::Relaxed,
+    );
+    MaxLevelGuard { previous }
 }
 
 /// Sets the global logger to a `Box<Log>`.
@@ -2041,5 +2209,72 @@ mod tests {
             #[cfg(feature = "std")]
             assert_is_log::<Arc<T>>();
         }
+    }
+
+    #[test]
+    fn test_pack_level_roundtrip() {
+        for level in 0..=5usize {
+            for generation in [0usize, 1, 7, 42, 100_000] {
+                let packed = super::pack_level(level, generation);
+                assert_eq!(super::unpack_level(packed), level);
+                assert_eq!(super::unpack_generation(packed), generation);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scoped_max_level_nested_restores_in_stack_order() {
+        use super::{max_level, set_max_level, set_max_level_scoped};
+
+        set_max_level(LevelFilter::Trace);
+
+        let outer = set_max_level_scoped(LevelFilter::Info);
+        assert_eq!(max_level(), LevelFilter::Info);
+        let inner = set_max_level_scoped(LevelFilter::Off);
+        assert_eq!(max_level(), LevelFilter::Off);
+
+        drop(inner);
+        assert_eq!(max_level(), LevelFilter::Info);
+        drop(outer);
+        assert_eq!(max_level(), LevelFilter::Trace);
+    }
+
+    #[test]
+    fn test_scoped_max_level_explicit_update_is_not_clobbered() {
+        use super::{max_level, set_max_level, set_max_level_scoped};
+
+        set_max_level(LevelFilter::Info);
+
+        let guard = set_max_level_scoped(LevelFilter::Trace);
+        assert_eq!(max_level(), LevelFilter::Trace);
+
+        // An explicit update invalidates the active guard, even if the value
+        // happens to equal the level the guard would restore.
+        set_max_level(LevelFilter::Warn);
+        drop(guard);
+        assert_eq!(max_level(), LevelFilter::Warn);
+
+        // Guards entered afterwards snapshot the explicit value.
+        let guard = set_max_level_scoped(LevelFilter::Error);
+        drop(guard);
+        assert_eq!(max_level(), LevelFilter::Warn);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_scoped_max_level_restores_on_unwind() {
+        use std::panic;
+
+        use super::{max_level, set_max_level, set_max_level_scoped};
+
+        set_max_level(LevelFilter::Warn);
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = set_max_level_scoped(LevelFilter::Off);
+            assert_eq!(max_level(), LevelFilter::Off);
+            panic!("abnormal scope exit");
+        }));
+        assert!(result.is_err());
+        assert_eq!(max_level(), LevelFilter::Warn);
     }
 }

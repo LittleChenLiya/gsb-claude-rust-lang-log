@@ -1,5 +1,10 @@
 # Change Log
 
+## [Unreleased]
+
+## What's Changed
+* Add `set_max_level_scoped`, returning a `MaxLevelGuard` that restores the previous maximum log level on drop. Nested guards restore in stack order, explicit `set_max_level`/`set_max_level_racy` updates while a guard is alive are never overwritten by the stale guard, and restoration also runs while unwinding a panic.
+
 ## [0.4.34] - 2026-08-22
 
 ## What's Changed
