@@ -1,5 +1,12 @@
 # Change Log
 
+## [Unreleased]
+
+### What's Changed
+* Add `kv::json`, a JSON bridge for key-values that never calls `Debug`. It only encodes the
+  scalar types `Value` publicly supports, rejects opaque values with their key path, checks
+  each pair before writing anything for it, and never emits partial JSON on failure.
+
 ## [0.4.34] - 2026-08-22
 
 ## What's Changed
